@@ -35,6 +35,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 struct win_kernel_state : kernel_state
 {
@@ -65,6 +66,49 @@ struct win_kernel_state : kernel_state
 	// Read out of the mapped ntoskrnl rather than hardcoded: guest_fs_dir is a build time switch
 	// across image sets that are already different builds, so the image is the only authority.
 	std::uint32_t nt_build_number = default_build_number;
+
+	// Names of images that must NOT be given their preferred base, so the guest ntdll relocates
+	// them instead. Off by default -- without it nothing changes.
+	//
+	// This is ASLR, in the only respect that matters here. The emulator otherwise places every
+	// image at its preferred base deterministically, which no real Windows system does: real
+	// ASLR moves the system DLLs and leaves the address space around them free. kernel32's
+	// preferred base is 0x180000000, and so is b.dll's -- the EAC user-mode module -- so in the
+	// guest kernel32 squats on 0x180000000+0xC2000 and b.dll can never be mapped where its own
+	// code expects. That is not just a layout nicety. b.dll writes ABSOLUTE self-references into
+	// heap memory (0122 measured ctx[0x98] = 0x180017374, a preferred-base constant), and an
+	// image relocation cannot retroactively patch a pointer the module already computed into a
+	// heap object. A relocated b.dll is a broken b.dll: its ordinal 3 export at 0x2D80B0 is not
+	// code, so calling it yields 0xC000001D (illegal instruction), whereas 0120 measured the same
+	// export faulting 0xC0000005 (access violation) in the live game. The guest result differs
+	// from the host precisely because the base differs.
+	//
+	// With --not-at-base=kernel32.dll the guest ntdll receives STATUS_IMAGE_NOT_AT_BASE for
+	// kernel32 and relocates it, exactly as real Windows does, leaving 0x180000000 free for b.dll.
+	std::unordered_set<std::string> not_at_base;
+
+	// Lowercase last-path-component lookup for not_at_base, with the same slash normalisation
+	// the filesystem uses, so a host path ('c:/windows/system32/kernel32.dll') and a bare name
+	// ('kernel32.dll') name the same image.
+	[[nodiscard]] bool base_forbidden(const std::string_view path) const
+	{
+		if (not_at_base.empty())
+			return false;
+
+		std::string lower(path);
+		for (auto& c : lower)
+		{
+			if (c == '\\')
+				c = '/';
+			c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+		}
+
+		const auto slash = lower.find_last_of('/');
+		const std::string_view leaf = slash == std::string::npos
+			? std::string_view(lower) : std::string_view(lower).substr(slash + 1);
+
+		return not_at_base.contains(std::string(leaf));
+	}
 
 	// ntoskrnl globals whose value is not knowable until every cpu exists. Resolved in the
 	// constructor because the module is not kept anywhere after that; written later.

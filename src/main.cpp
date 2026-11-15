@@ -53,12 +53,13 @@ struct guest_image
 
 void print_usage()
 {
-	LOG_INFO("usage: kernemul [--persist=DIR] image...");
+	LOG_INFO("usage: kernemul [--persist=DIR] [--not-at-base=NAME] image...");
 	LOG_INFO("examples:");
 	LOG_INFO("  kernemul test_driver.sys");
 	LOG_INFO("  kernemul test_printf.exe test_seh.exe");
 	LOG_INFO("  kernemul test_driver.sys test_user.exe");
 	LOG_INFO("  kernemul --persist=out guestprobe.exe");
+	LOG_INFO("  kernemul --persist=out --not-at-base=kernel32.dll bdllguest4.exe");
 	LOG_INFO("");
 	LOG_INFO("--persist writes every file the guest creates under DIR, so a guest process can");
 	LOG_INFO("report what it produced. Without it the guest filesystem stays in memory.");
@@ -200,6 +201,7 @@ int main(const int argc, const char* const* const argv)
 
 	std::vector<std::string> names;
 	std::optional<std::filesystem::path> persist_root;
+	std::vector<std::string> not_at_base;
 
 	for (int i = 1; i < argc; ++i)
 	{
@@ -208,6 +210,15 @@ int main(const int argc, const char* const* const argv)
 		if (arg.starts_with("--persist="))
 		{
 			persist_root = std::string(arg.substr(std::string_view("--persist=").size()));
+			continue;
+		}
+
+		if (arg.starts_with("--not-at-base="))
+		{
+			// Names an image that must be relocated by the guest loader rather than placed at
+			// its preferred base. Repeatable. Use --not-at-base=kernel32.dll to free up
+			// 0x180000000 for b.dll, whose absolute heap self-references only work there.
+			not_at_base.emplace_back(arg.substr(std::string_view("--not-at-base=").size()));
 			continue;
 		}
 
@@ -247,6 +258,15 @@ int main(const int argc, const char* const* const argv)
 	{
 		win.kernel().fs.set_mirror_root(*persist_root);
 		LOG_INFO("persisting guest-created files under '{}'", persist_root->string());
+	}
+
+	// Also before any image runs, because a system DLL is mapped during process creation and the
+	// point of this is that the guest loader relocates it rather than letting it squat on
+	// 0x180000000, which is where b.dll's own absolute heap pointers expect to live.
+	for (const auto& name : not_at_base)
+	{
+		win.kernel().not_at_base.insert(name);
+		LOG_INFO("image '{}' will not get its preferred base; the guest loader relocates it", name);
 	}
 
 	win.create_vcpus(vcpu_count);

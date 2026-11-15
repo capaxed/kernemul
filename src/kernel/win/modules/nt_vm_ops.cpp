@@ -1113,9 +1113,20 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 
 			addr_t base = 0;
 
+			// With --not-at-base an image is deliberately denied its preferred base, so the
+			// guest ntdll relocates it (the STATUS_IMAGE_NOT_AT_BASE path below) instead of
+			// squatting on an address b.dll needs. preferred is left set, so rebased and the
+			// return status are unaffected: this is what real ASLR does to a system DLL, and
+			// the guest loader's relocation handling is the code that makes it safe.
+			const bool force_off_base = st->base_forbidden(host->path);
+
+			if (force_off_base)
+				THREAD_LOG_INFO("NtMapViewOfSection('{}'): preferred base 0x{:X} forbidden, so the "
+					"guest loader will relocate it", host->path, preferred);
+
 			if (mem)
 			{
-				if (preferred)
+				if (preferred && !force_off_base)
 				{
 					addr_t at = preferred;
 					auto region = static_cast<std::size_t>(size);
