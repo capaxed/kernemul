@@ -99,7 +99,28 @@ public:
 			{
 				set_log_cpu(cpu.get());
 
-				scheduler_.run(*cpu);
+				// 0118: scheduler_.run is not noexcept, and an exception escaping here reaches
+				// std::terminate, whose MSVC path is __fastfail(FAST_FAIL_FATAL_APP_EXIT). The
+				// process then dies with 0xC0000409, no WER dump, no Application-log entry and
+				// no message -- while the guest log simply ends at whatever access the thrower
+				// was serving. That read for two rounds as a guest loader wall and was not one.
+				// So the exception is named before it is re-raised; the throw site attaches its
+				// own host backtrace, because unwinding has already removed the culprit by here.
+				try
+				{
+					scheduler_.run(*cpu);
+				}
+				catch (const std::exception& ex)
+				{
+					LOG_ERR("cpu {} host thread threw: {}", cpu->id(), ex.what());
+					throw;
+				}
+				catch (...)
+				{
+					LOG_ERR("cpu {} host thread threw a non-std exception", cpu->id());
+					throw;
+				}
+
 				--live;
 			});
 		}

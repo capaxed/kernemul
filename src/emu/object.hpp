@@ -7,6 +7,7 @@
 #include "../sym/symbol.hpp"
 #include <format>
 #include <cstddef>
+#include <optional>
 #include <type_traits>
 #include <typeinfo>
 #include <string>
@@ -113,27 +114,69 @@ public:
 		const auto base = addr_;
 		const auto name = name_;
 
+		// 0117: every read here may fault. This callback runs on the guest-access path, so a
+		// thrown std::runtime_error escapes the vmexit dispatch into std::terminate, which on
+		// MSVC is __fastfail(0xC0000409) -- the host process dies with no report and the guest
+		// log stops at whatever access the logger happened to be serving. That is exactly how
+		// this monitor masqueraded as a "loader wall" for two rounds: the last line of every
+		// user-mode run was a KUSER_SHARED_DATA access, which read like the guest stopping at
+		// ntdll!LdrpAppHeaders when in fact the host had just thrown. Reads that may not be
+		// serviceable are probed with a faulting-safe wrapper, and anything that would throw
+		// is logged without the enrichment rather than taking the machine down with it.
 		auto* const sp = space_;
+
+		auto read_u64 = [sp](addr_t at) -> std::optional<std::uint64_t>
+		{
+			try
+			{
+				return sp->read_mem<std::uint64_t>(at);
+			}
+			catch (...)
+			{
+				return std::nullopt;
+			}
+		};
+
 		hook_ = space_->mmu_->emu()->hook_mem(addr_, addr_ + sizeof(T) - 1, prot_rw,
-			[sp, base, name](vcpu& cpu, addr_t accessed, std::size_t, mem_prot access)
+			[sp, base, name, read_u64](vcpu& cpu, addr_t accessed, std::size_t, mem_prot access)
 			{
 				const auto rip = cpu.pc();
-				const auto offset = accessed - base;
-				std::uint64_t val = 0;
-				if (offset + 8 <= sizeof(T)) val = sp->read_mem<std::uint64_t>(accessed);
-				else if (offset + 4 <= sizeof(T)) val = sp->read_mem<std::uint32_t>(accessed);
-				else if (offset + 2 <= sizeof(T)) val = sp->read_mem<std::uint16_t>(accessed);
-				const auto r12 = cpu.reg<std::uint64_t>(12);
-				std::uint64_t m108 = 0, m110 = 0, m128 = 0, m190 = 0;
-				if (r12 > 0xFFFF000000000000ULL) {
-					m108 = sp->read_mem<std::uint64_t>(r12 + 0x108);
-					m110 = sp->read_mem<std::uint64_t>(r12 + 0x110);
-					m128 = sp->read_mem<std::uint64_t>(r12 + 0x128);
-					m190 = sp->read_mem<std::uint64_t>(r12 + 0x190);
+
+				// The address reported is whichever mapping the guest walked. KUSER_SHARED_DATA
+				// exists twice -- the kernel copy at 0xFFFFF800'00000000 and the user copy at
+				// 0xFFFFF780'00000000 -- and a hook installed on one sees accesses through the
+				// other, so the offset is only meaningful inside this object's own range.
+				// Measured: an offset of 0x8807FFE0308, which is the difference between the two
+				// bases, not a field of the struct. Enriching from a bogus offset is what threw.
+				const bool in_range = accessed >= base && accessed < base + sizeof(T);
+				const auto offset = in_range ? accessed - base : 0;
+
+				// A field the probe could not serve prints as "-" so the line still says what
+				// was accessed, which is the part that matters for following the guest.
+				const auto hex = [](const std::optional<std::uint64_t> v) -> std::string
+				{
+					return v ? std::format("0x{:X}", *v) : std::string("-");
+				};
+
+				if (!in_range)
+				{
+					LOG_INFO("0x{:X} accessed 0x{:X} ({} '{}' via the other mapping)",
+						rip, accessed, typeid(T).name(), name);
+					return;
 				}
-				LOG_INFO("0x{:X} accessed ({} '{}')+0x{:X} (val=0x{:X}, rbp=0x{:X}, r12=0x{:X}, [108]=0x{:X}, [110]=0x{:X}, [128]=0x{:X}, [190]=0x{:X})",
-					rip, typeid(T).name(), name, offset, val,
-					cpu.reg<std::uint64_t>(5), r12, m108, m110, m128, m190);
+
+				const auto val = read_u64(accessed);
+				const auto r12 = cpu.reg<std::uint64_t>(12);
+				std::optional<std::uint64_t> m108, m110, m128, m190;
+				if (r12 > 0xFFFF000000000000ULL) {
+					m108 = read_u64(r12 + 0x108);
+					m110 = read_u64(r12 + 0x110);
+					m128 = read_u64(r12 + 0x128);
+					m190 = read_u64(r12 + 0x190);
+				}
+				LOG_INFO("0x{:X} accessed ({} '{}')+0x{:X} (val={}, rbp=0x{:X}, r12=0x{:X}, [108]={}, [110]={}, [128]={}, [190]={})",
+					rip, typeid(T).name(), name, offset, hex(val),
+					cpu.reg<std::uint64_t>(5), r12, hex(m108), hex(m110), hex(m128), hex(m190));
 			}, space_);
 
 		return hook_;

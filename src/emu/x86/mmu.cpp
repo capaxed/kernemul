@@ -3,6 +3,8 @@
 #include "../emu.hpp"
 #include <stdexcept>
 #include <cstring>
+#include <format>
+#include "../../util/backtrace.hpp"
 
 namespace ia32 {
 #include <ia32.hpp>
@@ -298,7 +300,21 @@ void mmu::copy_virt(const addr_space& space, addr_t va, void* buf, std::size_t s
 			: translate_virt(space, page);
 
 		if (!frame)
-			throw std::runtime_error("unmapped virtual address");
+		{
+			// 0117: this throw is what ends every user-mode run, and it surfaces to the host as
+			// 0xC0000409 because it escapes scheduler_.run() into std::terminate, whose MSVC
+			// path is __fastfail(FAST_FAIL_FATAL_APP_EXIT). Naming the address and the copy
+			// direction is what turns that into a diagnosis: without it the guest log simply
+			// stops at the last access, which reads like a loader wall and is not one.
+			// The backtrace has to be taken here, not where the exception is caught: by then
+			// the stack has unwound past the code that asked for the address. skip=1 drops
+			// this throw's own frame.
+			const auto bt = util::host_backtrace(1);
+
+			throw std::runtime_error(std::format(
+				"unmapped virtual address 0x{:X} ({} copy, {} bytes requested at offset {:#x}){}",
+				cur_va, write ? "write" : "read", size, done, bt));
+		}
 
 		const addr_t pa = *frame + page_off;
 
