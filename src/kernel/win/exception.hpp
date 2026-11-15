@@ -12,6 +12,9 @@ constexpr std::uint32_t status_integer_divide_by_zero = 0xC0000094;
 constexpr std::uint32_t status_single_step            = 0x80000004;
 constexpr std::uint32_t status_breakpoint             = 0x80000003;
 constexpr std::uint32_t status_illegal_instruction    = 0xC000001D;
+// The code a __fastfail terminates with. Its own subtractions start at 29, which is the
+// vector the instruction raises; the two numbers are unrelated and both are needed.
+constexpr std::uint32_t status_fail_fast_exception     = 0xC0000409;
 
 struct dispatcher_context64
 {

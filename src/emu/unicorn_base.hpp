@@ -502,6 +502,11 @@ private:
 				// Not a fault the os dispatches. Returning without claiming it leaves Unicorn
 				// to discard the vector and resume, so the instruction after it runs -- but the
 				// guest's handler never does, which a check for that would see through.
+				//
+				// fast_fail is deliberately NOT in this set (0116): __fastfail is the guest
+				// saying "terminate me at this rip", so resuming past it invents execution the
+				// guest never asked for. It must reach the exception handler, which reports the
+				// rip and ends the process with the reason in ecx.
 				if (ex == cpu_exception::interrupt)
 					return;
 

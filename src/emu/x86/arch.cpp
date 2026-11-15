@@ -52,6 +52,13 @@ cpu_exception arch::intr_to_excp(int vector) const
 	case 6:  return cpu_exception::illegal_instruction;
 	case 14: return cpu_exception::page_fault;
 
+	// __fastfail. 29 is below 32 so the interrupt rule below never reached it, but it is
+	// an explicit request to terminate with a reason in ecx, not a fault a handler can
+	// resume. Measured: a guest ntdll that fails a control-flow-guard check raises this and
+	// the run dies 0xC0000409 with no dispatch line, because it was classified as an
+	// interrupt and discarded.
+	case 29: return cpu_exception::fast_fail;
+
 	// 0 to 31 are the architecture's own faults; 32 and up are interrupts, not the os's to
 	// dispatch.
 	default: return vector >= 32 ? cpu_exception::interrupt : cpu_exception::other;

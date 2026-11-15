@@ -126,6 +126,11 @@ enum class cpu_exception : std::uint8_t
 	illegal_instruction,
 	page_fault,
 	interrupt,
+	// INT 29h, the __fastfail instruction. Not an interrupt: the guest asked to die at this
+	// rip, and x86 windows encodes the reason in ecx (FAST_FAIL_*). A loader that fails a
+	// control-flow-guard check raises it, so treating it as an interrupt and resuming past it
+	// hides the reason the guest stopped. See 0116.
+	fast_fail,
 	other,
 };
 
@@ -139,6 +144,7 @@ constexpr std::string_view to_string(const cpu_exception ex)
 	case cpu_exception::illegal_instruction: return "illegal instruction";
 	case cpu_exception::page_fault:          return "page fault";
 	case cpu_exception::interrupt:           return "interrupt";
+	case cpu_exception::fast_fail:           return "fast fail";
 	case cpu_exception::other:               return "exception";
 	}
 

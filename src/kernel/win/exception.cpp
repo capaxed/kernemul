@@ -16,6 +16,7 @@ std::uint32_t exception_to_status(const cpu_exception ex)
 	case cpu_exception::debug:               return status_single_step;
 	case cpu_exception::breakpoint:          return status_breakpoint;
 	case cpu_exception::illegal_instruction: return status_illegal_instruction;
+	case cpu_exception::fast_fail:           return status_fail_fast_exception;
 	default:                                 return status_access_violation;
 	}
 }
@@ -78,6 +79,23 @@ bool win_exception::handle(vcpu& cpu, const cpu_exception ex)
 				if (v != 0) LOG_INFO("  [r12+0x{:X}] = 0x{:X}", off, v);
 			}
 		}
+	}
+
+	// __fastfail: the guest asked to die here, with the reason in ecx. There is nothing to
+	// dispatch -- no handler runs, no frame is built, no instruction after it executes. The
+	// reason code is the whole diagnostic, so it is reported and the process ends with
+	// STATUS_FAIL_FAST_EXCEPTION, which is what the host sees from a real one.
+	if (ex == cpu_exception::fast_fail)
+	{
+		const auto reason = cpu.reg<std::uint64_t>(1);
+		LOG_ERR("__fastfail at {}, reason ecx=0x{:X} -- the guest terminated itself here; "
+			"nothing after this instruction runs", symbols::format_addr(proc, original_pc), reason);
+
+		// set_exit_status is a win_thread member, and cpu.thread() hands back the base.
+		if (const auto wt = std::dynamic_pointer_cast<win_thread>(cpu.thread()))
+			wt->set_exit_status(static_cast<NTSTATUS>(status_fail_fast_exception));
+
+		return false;
 	}
 
 	exception_info info{};
