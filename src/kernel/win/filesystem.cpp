@@ -7,11 +7,15 @@
 #include <cctype>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <map>
+#include <ranges>
+#include <string>
 
 void win_file::write(const std::span<const std::uint8_t> buf)
 {
 	data_.assign(buf.begin(), buf.end());
+	dirty_ = true;
 }
 
 void win_file::write(const void* buf, const std::size_t size)
@@ -19,6 +23,7 @@ void win_file::write(const void* buf, const std::size_t size)
 	data_.resize(size);
 	if (buf && size > 0)
 		std::memcpy(data_.data(), buf, size);
+	dirty_ = true;
 }
 
 namespace
@@ -349,3 +354,53 @@ bool win_filesystem::load_dir(const std::filesystem::path& host_dir, const std::
 	LOG_INFO("filesystem: loaded directory '{}' -> '{}' ({} files)", host_dir.string(), base, file_count);
 	return true;
 }
+std::size_t win_filesystem::dump_dirty_files(const std::filesystem::path& host_disk_dir) const
+{
+	std::size_t written = 0;
+
+	for (const auto& [guest_path, file] : files_)
+	{
+		if (!file || !file->dirty())
+			continue;
+
+		// The normalized guest path is named from the drive letter down and uses forward
+		// slashes, so c:/windows/foo maps to <dir>/c/windows/foo. A path that does not have
+		// that shape is skipped rather than joined, because joining it could reach outside
+		// host_disk_dir.
+		if (guest_path.size() < 3 || guest_path[1] != ':' || guest_path[2] != '/')
+		{
+			LOG_WARN("filesystem: skip dump of unexpected path '{}'", guest_path);
+			continue;
+		}
+
+		std::filesystem::path host = host_disk_dir / guest_path.substr(0, 1);
+
+		for (const auto& part : std::views::split(guest_path.substr(3), '/'))
+		{
+			const std::string piece(part.begin(), part.end());
+			if (!piece.empty())
+				host /= piece;
+		}
+
+		std::error_code ec;
+		const auto parent = host.parent_path();
+		if (!parent.empty())
+			std::filesystem::create_directories(parent, ec);
+
+		std::ofstream out(host, std::ios::binary | std::ios::trunc);
+		if (!out)
+		{
+			LOG_WARN("filesystem: cannot write dumped file '{}'", host.string());
+			continue;
+		}
+
+		const auto data = file->data();
+		out.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+		++written;
+
+		LOG_INFO("filesystem: dumped '{}' -> '{}' ({} bytes)", guest_path, host.string(), data.size());
+	}
+
+	return written;
+}
+

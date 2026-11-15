@@ -246,6 +246,17 @@ int main(const int argc, const char* const* const argv)
 
 	win.run_all();
 
+	// 0118: the guest filesystem is memory-only, so file writes the guest made vanish when the
+	// process ends. Persisting the ones it dirtied into guest-out/ next to the guest fs is the
+	// only way a guest-side experiment can report what it produced -- and it is what makes
+	// "run b.dll inside the guest and capture its crypto output" possible. Without it a
+	// guest-side NtCreateFile/NtWriteFile succeeds and the bytes go nowhere.
+	{
+		const auto dumped = win.kernel().fs.dump_dirty_files("guest-out");
+		if (dumped > 0)
+			LOG_INFO("dumped {} guest-written file(s) to guest-out/", dumped);
+	}
+
 	for (const auto& image : images)
 	{
 		if (image.entry)
