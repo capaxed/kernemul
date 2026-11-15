@@ -9,13 +9,19 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
-#include <ranges>
-#include <string>
+
+namespace
+{
+	// A guest that writes more than this into one file is copying, not reporting. The mirror
+	// exists so a guest process can hand a result back, so the cap is there only to keep one
+	// runaway run from filling the host disk.
+	constexpr std::size_t mirror_size_limit = 64u * 1024 * 1024;
+}
 
 void win_file::write(const std::span<const std::uint8_t> buf)
 {
 	data_.assign(buf.begin(), buf.end());
-	dirty_ = true;
+	sync_mirror();
 }
 
 void win_file::write(const void* buf, const std::size_t size)
@@ -23,7 +29,53 @@ void win_file::write(const void* buf, const std::size_t size)
 	data_.resize(size);
 	if (buf && size > 0)
 		std::memcpy(data_.data(), buf, size);
-	dirty_ = true;
+	sync_mirror();
+}
+
+void win_file::resize(const std::size_t size)
+{
+	data_.resize(size);
+	sync_mirror();
+}
+
+// Synchronous on purpose: a guest run that faults halfway still leaves everything it wrote before
+// the fault on the host, and that is often the only evidence of where it got to.
+void win_file::sync_mirror()
+{
+	if (mirror_.empty())
+		return;
+
+	if (data_.size() > mirror_size_limit)
+	{
+		if (!mirror_announced_)
+		{
+			mirror_announced_ = true;
+			LOG_WARN("filesystem: '{}' is {} bytes, past the {}-byte mirror limit; not written out",
+				mirror_.string(), data_.size(), mirror_size_limit);
+		}
+
+		return;
+	}
+
+	std::error_code ec;
+	std::filesystem::create_directories(mirror_.parent_path(), ec);
+
+	std::ofstream out(mirror_, std::ios::binary | std::ios::trunc);
+
+	if (!out.is_open())
+	{
+		LOG_WARN("filesystem: cannot write '{}': {}", mirror_.string(), ec.message());
+		return;
+	}
+
+	out.write(reinterpret_cast<const char*>(data_.data()), static_cast<std::streamsize>(data_.size()));
+	out.close();
+
+	if (!mirror_announced_)
+	{
+		mirror_announced_ = true;
+		LOG_INFO("filesystem: mirrored '{}' ({} bytes)", mirror_.string(), data_.size());
+	}
 }
 
 namespace
@@ -94,8 +146,71 @@ std::shared_ptr<win_file> win_filesystem::create(const std::string_view path)
 {
 	const auto norm = normalize(path);
 	auto file = std::make_shared<win_file>();
+
+	// Every write the guest makes to a file it created itself is mirrored as it happens, so the
+	// host can read what the guest produced even when the run ends in a fault.
+	if (!mirror_root_.empty())
+		file->mirror_to(mirror_path(norm));
+
 	files_[norm] = file;
 	return file;
+}
+
+// Guest paths are object manager names -- "c:/windows/system32/ntdll.dll" -- and a drive colon
+// cannot appear in a host file name. Sanitising each component keeps the mirror tree shaped like
+// the guest's own, so a path in a log line is findable in the mirror without a mapping table.
+std::filesystem::path win_filesystem::mirror_path(const std::string_view virtual_path) const
+{
+	if (mirror_root_.empty())
+		return {};
+
+	constexpr std::string_view invalid_in_a_file_name = "<>:\"|?*";
+
+	std::filesystem::path out = mirror_root_;
+	std::size_t start = 0;
+
+	while (start <= virtual_path.size())
+	{
+		const auto slash = virtual_path.find('/', start);
+		const auto end = slash == std::string_view::npos ? virtual_path.size() : slash;
+
+		std::string component(virtual_path.substr(start, end - start));
+
+		for (auto& c : component)
+		{
+			if (invalid_in_a_file_name.find(c) != std::string_view::npos
+				|| static_cast<unsigned char>(c) < 0x20)
+			{
+				c = '_';
+			}
+		}
+
+		if (!component.empty() && component != "." && component != "..")
+			out /= component;
+
+		if (slash == std::string_view::npos)
+			break;
+
+		start = slash + 1;
+	}
+
+	return out;
+}
+
+std::size_t win_filesystem::flush_mirrors() const
+{
+	std::size_t count = 0;
+
+	for (const auto& [_, file] : files_)
+	{
+		if (file && file->has_mirror())
+		{
+			file->sync_mirror();
+			++count;
+		}
+	}
+
+	return count;
 }
 
 bool win_filesystem::remove(const std::string_view path)
@@ -354,53 +469,3 @@ bool win_filesystem::load_dir(const std::filesystem::path& host_dir, const std::
 	LOG_INFO("filesystem: loaded directory '{}' -> '{}' ({} files)", host_dir.string(), base, file_count);
 	return true;
 }
-std::size_t win_filesystem::dump_dirty_files(const std::filesystem::path& host_disk_dir) const
-{
-	std::size_t written = 0;
-
-	for (const auto& [guest_path, file] : files_)
-	{
-		if (!file || !file->dirty())
-			continue;
-
-		// The normalized guest path is named from the drive letter down and uses forward
-		// slashes, so c:/windows/foo maps to <dir>/c/windows/foo. A path that does not have
-		// that shape is skipped rather than joined, because joining it could reach outside
-		// host_disk_dir.
-		if (guest_path.size() < 3 || guest_path[1] != ':' || guest_path[2] != '/')
-		{
-			LOG_WARN("filesystem: skip dump of unexpected path '{}'", guest_path);
-			continue;
-		}
-
-		std::filesystem::path host = host_disk_dir / guest_path.substr(0, 1);
-
-		for (const auto& part : std::views::split(guest_path.substr(3), '/'))
-		{
-			const std::string piece(part.begin(), part.end());
-			if (!piece.empty())
-				host /= piece;
-		}
-
-		std::error_code ec;
-		const auto parent = host.parent_path();
-		if (!parent.empty())
-			std::filesystem::create_directories(parent, ec);
-
-		std::ofstream out(host, std::ios::binary | std::ios::trunc);
-		if (!out)
-		{
-			LOG_WARN("filesystem: cannot write dumped file '{}'", host.string());
-			continue;
-		}
-
-		const auto data = file->data();
-		out.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
-		++written;
-
-		LOG_INFO("filesystem: dumped '{}' -> '{}' ({} bytes)", guest_path, host.string(), data.size());
-	}
-
-	return written;
-}
-

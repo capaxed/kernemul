@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -52,11 +53,15 @@ struct guest_image
 
 void print_usage()
 {
-	LOG_INFO("usage: kernemul [image...]");
+	LOG_INFO("usage: kernemul [--persist=DIR] image...");
 	LOG_INFO("examples:");
 	LOG_INFO("  kernemul test_driver.sys");
 	LOG_INFO("  kernemul test_printf.exe test_seh.exe");
 	LOG_INFO("  kernemul test_driver.sys test_user.exe");
+	LOG_INFO("  kernemul --persist=out guestprobe.exe");
+	LOG_INFO("");
+	LOG_INFO("--persist writes every file the guest creates under DIR, so a guest process can");
+	LOG_INFO("report what it produced. Without it the guest filesystem stays in memory.");
 }
 
 std::shared_ptr<thread> setup_driver(guest::win_emulator& win,
@@ -193,7 +198,21 @@ int main(const int argc, const char* const* const argv)
 {
 	LOG_INFO("kernemul targeting {}", target::name);
 
-	std::vector<std::string> names(argv + 1, argv + argc);
+	std::vector<std::string> names;
+	std::optional<std::filesystem::path> persist_root;
+
+	for (int i = 1; i < argc; ++i)
+	{
+		const std::string_view arg(argv[i]);
+
+		if (arg.starts_with("--persist="))
+		{
+			persist_root = std::string(arg.substr(std::string_view("--persist=").size()));
+			continue;
+		}
+
+		names.emplace_back(arg);
+	}
 
 	if (names.empty())
 	{
@@ -223,6 +242,13 @@ int main(const int argc, const char* const* const argv)
 
 	guest::win_emulator win(e);
 
+	// Before any image runs, so a file the guest creates during process setup is mirrored too.
+	if (persist_root)
+	{
+		win.kernel().fs.set_mirror_root(*persist_root);
+		LOG_INFO("persisting guest-created files under '{}'", persist_root->string());
+	}
+
 	win.create_vcpus(vcpu_count);
 
 	const auto cpu = win.cpus().front();
@@ -246,17 +272,6 @@ int main(const int argc, const char* const* const argv)
 
 	win.run_all();
 
-	// 0118: the guest filesystem is memory-only, so file writes the guest made vanish when the
-	// process ends. Persisting the ones it dirtied into guest-out/ next to the guest fs is the
-	// only way a guest-side experiment can report what it produced -- and it is what makes
-	// "run b.dll inside the guest and capture its crypto output" possible. Without it a
-	// guest-side NtCreateFile/NtWriteFile succeeds and the bytes go nowhere.
-	{
-		const auto dumped = win.kernel().fs.dump_dirty_files("guest-out");
-		if (dumped > 0)
-			LOG_INFO("dumped {} guest-written file(s) to guest-out/", dumped);
-	}
-
 	for (const auto& image : images)
 	{
 		if (image.entry)
@@ -264,6 +279,12 @@ int main(const int argc, const char* const* const argv)
 		else
 			LOG_INFO("{} finished", image.name);
 	}
+
+	// Catches anything written through a mapped section rather than through write(), which the
+	// per-write mirror cannot see.
+	if (persist_root)
+		LOG_INFO("persisted {} guest file(s) under '{}'",
+			win.kernel().fs.flush_mirrors(), persist_root->string());
 
 	return 0;
 }

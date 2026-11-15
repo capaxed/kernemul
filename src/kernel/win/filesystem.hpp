@@ -22,13 +22,15 @@ public:
 	void write(std::span<const std::uint8_t> buf);
 	void write(const void* buf, std::size_t size);
 
-	void resize(std::size_t size) { data_.resize(size); dirty_ = true; }
+	void resize(std::size_t size);
 
-	// Whether the guest put bytes into this file. A file the emulator loaded from the host is
-	// clean until something writes to it, and a file the guest creates but never fills stays
-	// clean too -- boot_seed creates physicaldriveN entries as placeholders, and dumping those
-	// would be noise. So dirtiness, not creation, is what marks guest output.
-	[[nodiscard]] bool dirty() const noexcept { return dirty_; }
+	// Where these bytes also go on the host. A guest filesystem that lives only in memory is a
+	// dead end for anything that has to report a result: the guest process can write its answer
+	// and nothing outside the emulator can ever read it. Empty means guest only, which is every
+	// file loaded from the host tree.
+	void mirror_to(std::filesystem::path host_path) { mirror_ = std::move(host_path); }
+	[[nodiscard]] bool has_mirror() const noexcept { return !mirror_.empty(); }
+	void sync_mirror();
 
 	struct byte_lock
 	{
@@ -50,7 +52,8 @@ public:
 
 private:
 	std::vector<std::uint8_t> data_;
-	bool dirty_ = false;
+	std::filesystem::path mirror_;
+	bool mirror_announced_ = false;
 };
 
 class win_filesystem
@@ -89,18 +92,19 @@ public:
 
 	[[nodiscard]] std::vector<dir_entry> list_dir(std::string_view path) const;
 
-	// Write every file the guest filled into host_disk_dir, mirroring the guest path so
-	// c:/windows/foo lands as <dir>/c/windows/foo. Returns the number of files written.
-	//
-	// The guest filesystem is memory-only by design, which is fine while the guest is a driver
-	// whose result is visible in its return status, and a hard blocker the moment the guest has
-	// to report something it produced -- which is exactly what a user-mode experiment needs:
-	// run b.dll inside the guest and get its crypto output back out to the host. Without this,
-	// NtCreateFile/NtWriteFile succeed inside the emulator and the bytes go nowhere (0118).
-	std::size_t dump_dirty_files(const std::filesystem::path& host_disk_dir) const;
-
 	bool load_file(const std::filesystem::path& host_path, std::string_view virtual_path);
 	bool load_dir(const std::filesystem::path& host_dir, std::string_view virtual_path);
+
+	// Every file the guest creates from here on also lands under this host directory, at its
+	// guest path. Off unless a run asks for it, so an ordinary run still touches no host file.
+	void set_mirror_root(std::filesystem::path host_dir) { mirror_root_ = std::move(host_dir); }
+	[[nodiscard]] const std::filesystem::path& mirror_root() const noexcept { return mirror_root_; }
+
+	// Re-syncs every mirrored file, which is what catches bytes a guest wrote through a mapped
+	// section rather than through write(). Returns how many files it wrote.
+	std::size_t flush_mirrors() const;
+
+	[[nodiscard]] std::filesystem::path mirror_path(std::string_view virtual_path) const;
 
 	[[nodiscard]] static std::string normalize(std::string_view path);
 
@@ -110,4 +114,6 @@ private:
 	// Only the ones nothing else implies. A directory with files under it is still inferred,
 	// so this does not have to be kept in step with every create().
 	std::set<std::string> dirs_;
+
+	std::filesystem::path mirror_root_;
 };
