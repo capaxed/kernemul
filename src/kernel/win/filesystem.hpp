@@ -22,7 +22,13 @@ public:
 	void write(std::span<const std::uint8_t> buf);
 	void write(const void* buf, std::size_t size);
 
-	void resize(std::size_t size) { data_.resize(size); }
+	void resize(std::size_t size) { data_.resize(size); dirty_ = true; }
+
+	// Whether the guest put bytes into this file. A file the emulator loaded from the host is
+	// clean until something writes to it, and a file the guest creates but never fills stays
+	// clean too -- boot_seed creates physicaldriveN entries as placeholders, and dumping those
+	// would be noise. So dirtiness, not creation, is what marks guest output.
+	[[nodiscard]] bool dirty() const noexcept { return dirty_; }
 
 	struct byte_lock
 	{
@@ -44,6 +50,7 @@ public:
 
 private:
 	std::vector<std::uint8_t> data_;
+	bool dirty_ = false;
 };
 
 class win_filesystem
@@ -81,6 +88,16 @@ public:
 	bool link(std::string_view from, std::string_view to);
 
 	[[nodiscard]] std::vector<dir_entry> list_dir(std::string_view path) const;
+
+	// Write every file the guest filled into host_disk_dir, mirroring the guest path so
+	// c:/windows/foo lands as <dir>/c/windows/foo. Returns the number of files written.
+	//
+	// The guest filesystem is memory-only by design, which is fine while the guest is a driver
+	// whose result is visible in its return status, and a hard blocker the moment the guest has
+	// to report something it produced -- which is exactly what a user-mode experiment needs:
+	// run b.dll inside the guest and get its crypto output back out to the host. Without this,
+	// NtCreateFile/NtWriteFile succeed inside the emulator and the bytes go nowhere (0118).
+	std::size_t dump_dirty_files(const std::filesystem::path& host_disk_dir) const;
 
 	bool load_file(const std::filesystem::path& host_path, std::string_view virtual_path);
 	bool load_dir(const std::filesystem::path& host_dir, std::string_view virtual_path);
