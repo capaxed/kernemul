@@ -63,6 +63,22 @@ bool win_exception::handle(vcpu& cpu, const cpu_exception ex)
 
 	LOG_INFO("exception dispatch: code=0x{:X}, rip={}, address=0x{:X}", code,
 		symbols::format_addr(proc, original_pc), cpu.arch()->fault_addr(cpu));
+	{
+		const auto r12 = cpu.reg<std::uint64_t>(12);
+		const auto rsp = cpu.sp();
+		LOG_INFO("  regs: rax=0x{:X} rcx=0x{:X} rdx=0x{:X} rbx=0x{:X} rsp=0x{:X} rbp=0x{:X} rsi=0x{:X} rdi=0x{:X} r12=0x{:X}",
+			cpu.reg<std::uint64_t>(0), cpu.reg<std::uint64_t>(1), cpu.reg<std::uint64_t>(2), cpu.reg<std::uint64_t>(3),
+			rsp, cpu.reg<std::uint64_t>(5), cpu.reg<std::uint64_t>(6), cpu.reg<std::uint64_t>(7), r12);
+		if (r12 > 0xFFFF000000000000ULL)
+		{
+			auto& spc = *cpu.curr_addr_space();
+			for (std::size_t off = 0x0; off <= 0x280; off += 8)
+			{
+				const auto v = spc.read_mem<std::uint64_t>(r12 + off);
+				if (v != 0) LOG_INFO("  [r12+0x{:X}] = 0x{:X}", off, v);
+			}
+		}
+	}
 
 	exception_info info{};
 	info.code = code;

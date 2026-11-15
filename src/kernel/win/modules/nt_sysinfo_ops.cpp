@@ -728,9 +728,28 @@ void modules::register_ntoskrnl_sysinfo_ops(win_kernel_state& state, proc_module
 		}
 
 		default:
-			THREAD_LOG_WARN("NtQuerySystemInformation: unhandled class {}",
+			// Measured: the usermode loader stops at LdrpAppHeaders after asking for classes 192
+			// and 197, both of which land here and get STATUS_INVALID_INFO_CLASS. ntdll treats a
+			// hard failure as fatal during init, whereas a SUCCESS with a zeroed buffer is the
+			// shape most callers can survive -- ntdll's own pattern for optional information.
+			//
+			// This is deliberately permissive: the goal is to get the loader past init so we can
+			// see what it asks for NEXT, which is more informative than stopping here.
+			THREAD_LOG_WARN("NtQuerySystemInformation: class {} has no handler; returning zeroed SUCCESS",
 				system_information_class);
-			return STATUS_INVALID_INFO_CLASS;
+
+			if (return_length)
+				return_length.write(0);
+
+			if (length > 0 && system_information != 0)
+			{
+				// Zero what the caller asked for, capped so a bogus size cannot scribble.
+				const auto to_zero = length > 0x1000 ? 0x1000u : length;
+				for (std::uint32_t i = 0; i < to_zero; ++i)
+					space.write_mem(system_information + i, static_cast<std::uint8_t>(0));
+			}
+
+			return STATUS_SUCCESS;
 		}
 	};
 

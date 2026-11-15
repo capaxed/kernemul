@@ -106,21 +106,34 @@ public:
 
 	emu_hook* monitor()
 	{
-		// Installing twice would leak the first hook and log every access a second time.
+		if (name_ != "KPCR[0]" && name_ != "KUSER_SHARED_DATA") return nullptr;
 		if (hook_ || !space_ || !addr_)
 			return hook_;
 
 		const auto base = addr_;
 		const auto name = name_;
 
+		auto* const sp = space_;
 		hook_ = space_->mmu_->emu()->hook_mem(addr_, addr_ + sizeof(T) - 1, prot_rw,
-			[base, name](vcpu& cpu, addr_t accessed, std::size_t, mem_prot access)
+			[sp, base, name](vcpu& cpu, addr_t accessed, std::size_t, mem_prot access)
 			{
 				const auto rip = cpu.pc();
 				const auto offset = accessed - base;
-
-				LOG_INFO("0x{:X} accessed ({} '{}')+0x{:X} (type={})",
-					rip, typeid(T).name(), name, offset, static_cast<unsigned>(access));
+				std::uint64_t val = 0;
+				if (offset + 8 <= sizeof(T)) val = sp->read_mem<std::uint64_t>(accessed);
+				else if (offset + 4 <= sizeof(T)) val = sp->read_mem<std::uint32_t>(accessed);
+				else if (offset + 2 <= sizeof(T)) val = sp->read_mem<std::uint16_t>(accessed);
+				const auto r12 = cpu.reg<std::uint64_t>(12);
+				std::uint64_t m108 = 0, m110 = 0, m128 = 0, m190 = 0;
+				if (r12 > 0xFFFF000000000000ULL) {
+					m108 = sp->read_mem<std::uint64_t>(r12 + 0x108);
+					m110 = sp->read_mem<std::uint64_t>(r12 + 0x110);
+					m128 = sp->read_mem<std::uint64_t>(r12 + 0x128);
+					m190 = sp->read_mem<std::uint64_t>(r12 + 0x190);
+				}
+				LOG_INFO("0x{:X} accessed ({} '{}')+0x{:X} (val=0x{:X}, rbp=0x{:X}, r12=0x{:X}, [108]=0x{:X}, [110]=0x{:X}, [128]=0x{:X}, [190]=0x{:X})",
+					rip, typeid(T).name(), name, offset, val,
+					cpu.reg<std::uint64_t>(5), r12, m108, m110, m128, m190);
 			}, space_);
 
 		return hook_;
